@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-carla/
+venv/
+.env
+.pytest_cache/
+
+# CARLA telemetry capture drops (raw JSON before it's loaded into Bronze)
+data/raw_captures/**
+!data/raw_captures/.gitkeep
+
+# Data lake payloads - keep the folder structure, not the contents
+data/bronze/**
+data/silver/**
+data/gold/**
+data/_manifest/**
+!data/**/.gitkeep
+
+# Local IDD / CARLA source drops
+*.tar
+*.tar.gz
+*.zip
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

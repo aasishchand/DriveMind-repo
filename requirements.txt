@@ -1,0 +1,14 @@
+# DriveMind ETL - Member 1 (Data Engineering & ETL)
+# Approved stack only. Ask the team before adding anything below the line.
+
+pandas>=2.0
+pyarrow>=14.0
+pandera>=0.18
+psycopg[binary]>=3.1        # PostgreSQL driver (approved); load_*.py --push + db/records.py
+pytest>=8.0                 # test suite under tests/
+
+# ---------------------------------------------------------------------------
+# NOT YET ADDED - pending team approval
+# ---------------------------------------------------------------------------
+# Orchestration (Airflow / Prefect / Dagster) is explicitly deferred until the
+# script pipeline is stable.
