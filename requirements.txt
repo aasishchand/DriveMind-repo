@@ -6,6 +6,11 @@ pyarrow>=14.0
 pandera>=0.18
 psycopg[binary]>=3.1        # PostgreSQL driver (approved); load_*.py --push + db/records.py
 pytest>=8.0                 # test suite under tests/
+torch>=2.3                  # DriveMind LSTM trajectory prediction
+torchvision>=0.18           # dedicated emergency Faster R-CNN detector (match torch build)
+Pillow>=10.0                # camera preview and emergency dataset images
+roboflow>=1.1               # download annotated emergency vehicle dataset
+PyYAML>=6.0                 # read Roboflow YOLO class maps when merging sources
 
 # ---------------------------------------------------------------------------
 # NOT YET ADDED - pending team approval

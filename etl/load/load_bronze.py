@@ -100,6 +100,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--split", choices=("train", "val", "test"))
     parser.add_argument("--idd-root", type=Path, default=None)
     parser.add_argument(
+        "--from-polygons",
+        action="store_true",
+        help="idd detection/temporal: derive boxes from polygon JSON instead of VOC XML",
+    )
+    parser.add_argument(
         "--push", action="store_true", help="upsert the manifest row into PostgreSQL"
     )
     parser.add_argument(
@@ -120,7 +125,9 @@ def main(argv: list[str] | None = None) -> int:
         if not (args.variant and args.split):
             parser.error("--variant and --split are required for --domain idd")
         name = args.name or f"idd_{args.variant}_{args.split}"
-        df = extract_idd(args.variant, args.split, args.idd_root)
+        df = extract_idd(
+            args.variant, args.split, args.idd_root, from_polygons=args.from_polygons
+        )
         variant = args.variant
 
     out = load_bronze(df, domain=args.domain, name=name, source_variant=variant)

@@ -1,15 +1,25 @@
-"""Capture real CARLA telemetry to a JSON log that etl.extract.extract_carla can read.
+"""Capture real CARLA telemetry (+ optionally camera images and safety events)
+to files that the ETL pipeline can read.
 
 Runs against a live ``CarlaUE4.exe`` server. Spawns an ego vehicle, one emergency
 vehicle, and N background vehicles on autopilot; steps the simulation in
 synchronous mode at a fixed tick rate; records every actor's state each tick.
 
-The output is a flat JSON list of records with exactly the keys
-``etl.extract.extract_carla.RAW_COLUMNS`` expects, so it plugs straight into the
-main pipeline:
+Three outputs, the latter two optional:
 
-    python -m etl.load.load_bronze --domain carla_telemetry \\
-        --name demo_overtake --scenario-log data/raw_captures/demo_overtake.json
+  * ``--out``                    telemetry JSON - keys match
+                                  ``etl.extract.extract_carla.RAW_COLUMNS``,
+                                  plugs straight into the main pipeline:
+                                      python -m etl.load.load_bronze --domain carla_telemetry \\
+                                          --name demo_overtake --scenario-log data/raw_captures/demo_overtake.json
+  * ``--images-out DIR``         one PNG per sampled tick from an RGB camera
+                                  mounted on the ego vehicle (``sensor.camera.rgb``)
+  * ``--events-out FILE``        JSON list of collision
+                                  (``sensor.other.collision``) and lane-invasion
+                                  (``sensor.other.lane_invasion``) events on the
+                                  ego vehicle - not yet wired into a Bronze/Silver
+                                  schema (telemetry's common schema doesn't cover
+                                  discrete events); this is a raw capture only.
 
 IMPORTANT - this runs in a SEPARATE Python environment matching whatever
 version your CARLA build's client wheel targets (check
@@ -18,7 +28,9 @@ See scripts/README.md.
 
 Run:
     python capture_carla_telemetry.py --scenario-name demo_overtake \\
-        --duration 10 --out data/raw_captures/demo_overtake.json
+        --duration 10 --out data/raw_captures/demo_overtake.json \\
+        --images-out data/raw_captures/demo_overtake_images \\
+        --events-out data/raw_captures/demo_overtake_events.json
 
 Troubleshooting: if a blueprint id 404s ("blueprint not found"), run with
 --list-blueprints to print what your CARLA build actually has, then pass
@@ -70,6 +82,23 @@ def _spawn(world, blueprint, transform, *, role_name: str | None = None):
     return world.try_spawn_actor(bp, transform)
 
 
+def _waypoint_ahead(world, transform, distance: float):
+    """A transform ``distance`` metres ahead of ``transform``, following the
+    same lane (via the waypoint graph) - so a vehicle spawned there is on the
+    same road, facing the same way, actually in front of the camera. Returns
+    None if the road doesn't extend that far (e.g. spawn near a dead end)."""
+    carla_map = world.get_map()
+    wp = carla_map.get_waypoint(transform.location, project_to_road=True)
+    if wp is None:
+        return None
+    ahead = wp.next(distance)
+    if not ahead:
+        return None
+    target = ahead[0].transform
+    target.location.z += 0.5  # avoid spawning half-embedded in the road mesh
+    return target
+
+
 def spawn_actors(world, tm_port: int, args) -> list[tuple[str, "carla.Actor"]]:
     bp_lib = world.get_blueprint_library()
     spawn_points = world.get_map().get_spawn_points()
@@ -83,7 +112,8 @@ def spawn_actors(world, tm_port: int, args) -> list[tuple[str, "carla.Actor"]]:
     actors: list[tuple[str, "carla.Actor"]] = []
 
     ego_bp = bp_lib.find(args.ego_blueprint)
-    ego = _spawn(world, ego_bp, spawn_points.pop(), role_name="ego")
+    ego_spawn_point = spawn_points.pop()
+    ego = _spawn(world, ego_bp, ego_spawn_point, role_name="ego")
     if ego is None:
         raise RuntimeError(f"could not spawn ego blueprint {args.ego_blueprint!r}")
     ego.set_autopilot(True, tm_port)
@@ -91,7 +121,21 @@ def spawn_actors(world, tm_port: int, args) -> list[tuple[str, "carla.Actor"]]:
 
     if args.emergency:
         em_bp = bp_lib.find(args.emergency_blueprint)
-        em = _spawn(world, em_bp, spawn_points.pop())
+        em = None
+        if args.emergency_ahead:
+            ahead_transform = _waypoint_ahead(world, ego_spawn_point, args.emergency_ahead_distance)
+            if ahead_transform is not None:
+                em = _spawn(world, em_bp, ahead_transform)
+                if em is not None:
+                    print(
+                        f"[capture] emergency vehicle placed {args.emergency_ahead_distance:.0f}m "
+                        "ahead of ego, same lane"
+                    )
+        if em is None:
+            # fall back to a random spawn point - road too short, or blocked
+            em = _spawn(world, em_bp, spawn_points.pop())
+            if em is not None and args.emergency_ahead:
+                print("[capture] warning: couldn't place emergency vehicle ahead of ego; used a random spawn instead")
         if em is not None:
             em.set_autopilot(True, tm_port)
             try:  # not every blueprint exposes a light bar; best-effort only
@@ -114,10 +158,87 @@ def spawn_actors(world, tm_port: int, args) -> list[tuple[str, "carla.Actor"]]:
     return actors
 
 
-def capture(world, actors, args) -> list[dict]:
+def spawn_sensors(world, ego, args) -> tuple[list["carla.Actor"], dict]:
+    """Attach an optional RGB camera and collision/lane-invasion sensors to
+    ``ego``. Returns (sensor_actors, state) where state holds the mutable
+    ``events`` list the sensor callbacks append to (callbacks fire on a CARLA
+    background thread, driven by world.tick() in synchronous mode)."""
+    bp_lib = world.get_blueprint_library()
+    sensors: list["carla.Actor"] = []
+    state = {"events": [], "images_written": 0}
+
+    if args.images_out:
+        args.images_out.mkdir(parents=True, exist_ok=True)
+        cam_bp = bp_lib.find("sensor.camera.rgb")
+        cam_bp.set_attribute("image_size_x", str(args.image_width))
+        cam_bp.set_attribute("image_size_y", str(args.image_height))
+        cam_bp.set_attribute("fov", "90")
+        cam_transform = carla.Transform(carla.Location(x=1.5, z=2.0))
+        camera = world.spawn_actor(cam_bp, cam_transform, attach_to=ego)
+
+        every_n = max(args.image_every_n_ticks, 1)
+
+        def _on_image(image, _every_n=every_n, _dir=args.images_out, _state=state):
+            if image.frame % _every_n == 0:
+                image.save_to_disk(str(_dir / f"frame_{image.frame:06d}.png"))
+                _state["images_written"] += 1
+
+        camera.listen(_on_image)
+        sensors.append(camera)
+        print(f"[capture] camera attached -> {args.images_out} (every {every_n} ticks)")
+
+    if args.events_out:
+        col_bp = bp_lib.find("sensor.other.collision")
+        col_sensor = world.spawn_actor(col_bp, carla.Transform(), attach_to=ego)
+
+        def _on_collision(event, _state=state):
+            other = event.other_actor
+            impulse = event.normal_impulse
+            _state["events"].append(
+                {
+                    "event_type": "collision",
+                    "frame": event.frame,
+                    "sim_time": round(event.timestamp, 3),
+                    "actor_id": "ego",
+                    "other_actor_type": other.type_id if other is not None else None,
+                    "impulse": [impulse.x, impulse.y, impulse.z],
+                }
+            )
+
+        col_sensor.listen(_on_collision)
+        sensors.append(col_sensor)
+
+        lane_bp = bp_lib.find("sensor.other.lane_invasion")
+        lane_sensor = world.spawn_actor(lane_bp, carla.Transform(), attach_to=ego)
+
+        def _on_lane_invasion(event, _state=state):
+            _state["events"].append(
+                {
+                    "event_type": "lane_invasion",
+                    "frame": event.frame,
+                    "sim_time": round(event.timestamp, 3) if hasattr(event, "timestamp") else None,
+                    "actor_id": "ego",
+                    "crossed_lane_markings": [str(m.type) for m in event.crossed_lane_markings],
+                }
+            )
+
+        lane_sensor.listen(_on_lane_invasion)
+        sensors.append(lane_sensor)
+        print("[capture] collision + lane-invasion sensors attached")
+
+    return sensors, state
+
+
+def capture(world, actors, args) -> tuple[list[dict], int]:
+    """Returns (records, base_frame). ``base_frame`` is the server's absolute
+    frame number just before the first tick - sensor event callbacks only get
+    CARLA's absolute ``event.frame``/``event.timestamp`` (server uptime, not
+    capture-relative), so callers subtract this off to get a sim_time that
+    actually starts at 0 like the telemetry does."""
     records: list[dict] = []
     n_ticks = int(round(args.duration * args.tick_hz))
     carla_map = world.get_map()
+    base_frame = world.get_snapshot().frame
 
     for tick in range(n_ticks):
         world.tick()
@@ -161,7 +282,7 @@ def capture(world, actors, args) -> list[dict]:
         if tick % args.tick_hz == 0:
             print(f"[capture] t={sim_time:6.2f}s  ({tick}/{n_ticks} ticks)")
 
-    return records
+    return records, base_frame
 
 
 def list_blueprints(world, pattern: str) -> None:
@@ -180,9 +301,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--num-vehicles", type=int, default=6, help="including ego + emergency")
     parser.add_argument("--emergency", action="store_true", default=True)
     parser.add_argument("--no-emergency", dest="emergency", action="store_false")
+    parser.add_argument(
+        "--emergency-ahead",
+        action="store_true",
+        default=True,
+        help="place the emergency vehicle N metres ahead of ego on the same lane (default), "
+        "instead of a random spawn point",
+    )
+    parser.add_argument("--no-emergency-ahead", dest="emergency_ahead", action="store_false")
+    parser.add_argument("--emergency-ahead-distance", type=float, default=25.0)
     parser.add_argument("--ego-blueprint", default=DEFAULT_EGO_BLUEPRINT)
     parser.add_argument("--emergency-blueprint", default=DEFAULT_EMERGENCY_BLUEPRINT)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--images-out",
+        type=Path,
+        default=None,
+        help="directory to save ego-vehicle RGB camera frames as PNGs; omit to skip image capture",
+    )
+    parser.add_argument("--image-width", type=int, default=960)
+    parser.add_argument("--image-height", type=int, default=540)
+    parser.add_argument(
+        "--image-every-n-ticks",
+        type=int,
+        default=10,
+        help="save one frame every N ticks (default: every 0.5s at 20Hz)",
+    )
+    parser.add_argument(
+        "--events-out",
+        type=Path,
+        default=None,
+        help="path for a JSON log of ego collision/lane-invasion events; omit to skip",
+    )
     parser.add_argument(
         "--list-blueprints",
         metavar="PATTERN",
@@ -213,10 +363,28 @@ def main(argv: list[str] | None = None) -> int:
     tm.set_synchronous_mode(True)
 
     actors: list[tuple[str, "carla.Actor"]] = []
+    sensors: list["carla.Actor"] = []
+    sensor_state: dict = {"events": [], "images_written": 0}
+    base_frame = 0
     try:
         actors = spawn_actors(world, tm.get_port(), args)
-        records = capture(world, actors, args)
+        ego = actors[0][1]  # spawn_actors always puts ego first
+        sensors, sensor_state = spawn_sensors(world, ego, args)
+        records, base_frame = capture(world, actors, args)
     finally:
+        # Sensors first (attached children), then vehicles. Stop listening
+        # before destroy so no callback fires on a half-destroyed actor.
+        for sensor in sensors:
+            try:
+                sensor.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        for sensor in sensors:
+            try:
+                if sensor.is_alive:
+                    sensor.destroy()
+            except Exception:  # noqa: BLE001
+                pass
         # Disabling autopilot before destroy, and ticking once more while
         # still synchronous, avoids a native crash in the traffic manager that
         # can happen when destroying an autopilot-controlled actor right
@@ -247,6 +415,20 @@ def main(argv: list[str] | None = None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(records))
     print(f"[capture] wrote {len(records)} rows ({len(actors)} actors) -> {args.out}")
+
+    if args.images_out:
+        print(f"[capture] wrote {sensor_state['images_written']} images -> {args.images_out}")
+    if args.events_out:
+        args.events_out.parent.mkdir(parents=True, exist_ok=True)
+        events = sorted(sensor_state["events"], key=lambda e: e["frame"])
+        # event.timestamp/frame from CARLA are server-absolute (uptime since
+        # server start), not capture-relative - rewrite sim_time to start at 0
+        # like the telemetry does, so the two logs are comparable.
+        for event in events:
+            event["sim_time"] = round((event["frame"] - base_frame) / args.tick_hz, 3)
+        args.events_out.write_text(json.dumps(events))
+        print(f"[capture] wrote {len(events)} events -> {args.events_out}")
+
     return 0
 
 

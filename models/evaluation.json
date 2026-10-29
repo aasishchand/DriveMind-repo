@@ -1,0 +1,21 @@
+{
+  "model": {
+    "ADE_m": 0.7540319561958313,
+    "FDE_m": 1.8390073776245117,
+    "mean_inference_latency_ms": 0.17855044448677088,
+    "p95_inference_latency_ms": 0.24757499868428565,
+    "trajectories": 450
+  },
+  "constant_velocity": {
+    "ADE_m": 1.447719931602478,
+    "FDE_m": 3.289485216140747,
+    "mean_inference_latency_ms": 0.035778666658896126,
+    "trajectories": 450
+  },
+  "test_scenarios": [
+    "drivemind_carla_test_slow"
+  ],
+  "coordinate_units": "metres",
+  "prediction_horizon_seconds": 1.5,
+  "split_method": "scenario-level; no scenario is shared across train, validation, and test"
+}

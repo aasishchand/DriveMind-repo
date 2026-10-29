@@ -1,5 +1,168 @@
 # DriveMind - ETL (Member 1: Data Engineering & ETL)
 
+## 2D autonomous driving demo
+
+The repository now also includes a dependency-free Tkinter demonstration that
+connects a simulation-aware perception baseline to constant-velocity
+prediction, TTC/risk scoring, planner decisions, and a speed/lane controller.
+CARLA remains optional; the current GUI uses synthetic simulation actors and
+does not claim camera-based perception or real-world safety performance.
+
+Launch it from the repository root:
+
+```powershell
+\.venv-carla\Scripts\python.exe main.py
+```
+
+This installed Python 3.12 environment already includes Tkinter; the demo
+itself does not use its CARLA client package.
+
+When the CARLA 0.9.16 server is running, launch the planner against the real
+CARLA world with the same environment:
+
+```powershell
+\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
+  --scenario "Emergency vehicle approaching" --duration 10
+```
+
+CARLA Traffic Manager moves surrounding traffic; DriveMind's planner and speed
+controller command the ego vehicle. Raw CARLA records go to
+`data/raw_captures/`, and controller/risk telemetry goes to
+`data/simulation/telemetry/`. Load the generated raw JSON through the existing
+Bronze and Silver loaders, then rebuild Gold as shown in
+[scripts/README.md](scripts/README.md). The Tk dashboard stays available as a
+lightweight 2D view.
+
+Choose one of five scenarios and one of three planners in the window. Start,
+Pause, Reset, or press `1`–`5` to switch scenarios and Space to pause/resume.
+Run experiments compares all three modes over the same five seeded scenarios;
+the measured CSV and JSON reports are written under
+`data/simulation/evaluation/`. Live run telemetry is saved as CSV under
+`data/simulation/telemetry/`. These simulation CSVs remain separate from the
+existing Parquet ETL contracts. Pygame, CARLA server, YOLO, and OpenCV are not
+required for this fallback.
+
+## Train the trajectory model
+
+The repository includes a trained, CPU-sized PyTorch LSTM checkpoint. It is
+trained from the CARLA Gold `trajectory_windows` parquet using complete
+scenario groups for train, validation, and held-out test. The Gold windows
+contain 20 history and 30 future samples at 20 Hz, so the trained prediction
+horizon is 1.5 seconds. Training and test ADE/FDE results are saved beside the
+checkpoint.
+
+After loading new CARLA Silver data and rebuilding Gold, retrain with:
+
+```powershell
+python -m etl.prediction.train
+```
+
+The live dashboard loads `models/trajectory_lstm.pt` at startup, shows ML and
+constant-velocity predictions with separate line styles, and falls back to
+constant velocity if the checkpoint is unavailable or inference fails.
+
+## Camera-based emergency vehicle detector
+
+DriveMind has a separate `emergency_detection/` Faster R-CNN model (ResNet-50
+FPN) with its own checkpoint, training code, inference, tracker, and held-out
+metrics. It is separate from the trajectory LSTM. The live CARLA runner attaches
+an RGB camera and sends those pixels to the detector. CARLA actor blueprints and
+emergency lights are retained only in raw ground-truth telemetry and are never
+detector inputs or emergency class labels for the planner. Model outputs are
+shown in the camera preview and fed into risk-aware planning. Range and TTC are
+camera estimates from box height and frame-to-frame range; they are not CARLA
+ground truth. Ordinary vehicles map to a separate non-emergency class.
+
+**Current status: TRAINED.** The saved Faster R-CNN checkpoint reports 71.6%
+mAP50 and 85.4% recall on its held-out split; precision is 16.7%, so false
+detections remain a limitation. The checkpoint is stored with Git LFS. The
+Roboflow source datasets are local and excluded from Git; download and prepare
+them using the commands below if you need to retrain. Training requires a
+working `torch`/`torchvision` pair; on Windows, install matching builds for
+your CPU/CUDA setup.
+
+### Prepare a dataset
+
+The detector can use three Roboflow sources: general vehicles, emergency
+vehicles, and ITAWD Indian-road scenes. Install the dataset dependencies, set
+`ROBOFLOW_API_KEY` in the terminal session, then fetch all three version 1
+YOLOv8 exports:
+
+```powershell
+\.venv-carla\Scripts\python.exe -m pip install roboflow pyyaml
+$env:ROBOFLOW_API_KEY = "your Roboflow API key"
+\.venv-carla\Scripts\python.exe -m emergency_detection.download_roboflow
+```
+
+Exports are saved under `data/datasets/` (ignored by Git). The merger reads
+each `data.yaml` class list, maps ambulance/firetruck/police to the emergency
+classes, and maps supported road vehicle labels to `ordinary_vehicle`. ITAWD's
+non-vehicle labels are ignored. These sources list CC BY 4.0 licenses; retain
+their attribution and review the license terms before redistributing datasets
+or trained weights.
+
+Combine the three exports into DriveMind's canonical YOLO labels:
+
+```powershell
+\.venv-carla\Scripts\python.exe -m emergency_detection.combine_roboflow `
+  --emergency data\datasets\emergency-vehicles `
+  --vehicles data\datasets\general-vehicles `
+  --itawd data\datasets\itawd `
+  --output data\datasets\drivemind-emergency
+```
+
+The converter maps labels to DriveMind's canonical IDs: `0 ambulance`,
+`1 fire_truck`, `2 police_vehicle`, `3 ordinary_vehicle`. The trainer
+deduplicates exact image files by SHA-256 before a deterministic
+train/validation/test split; annotations are validated as YOLO normalized
+boxes. Training applies horizontal flips and color augmentation.
+
+### Train, evaluate, and run
+
+```powershell
+\.venv-carla\Scripts\python.exe -m emergency_detection.train --data data\datasets\drivemind-emergency `
+  --epochs 20 --batch-size 2
+```
+
+The trainer saves `emergency_detection/weights/emergency_detector.pt`,
+`training_history.csv`, `evaluation.json`, and `training_metadata.json` only
+after actual training/evaluation. Metrics include precision, recall, AP50,
+AP50:95, per-class results, and a background-aware confusion matrix. Do not
+compare these results with the dataset publisher's separately trained model.
+
+Run CARLA with the live annotated RGB camera window (close it to stop the
+preview, or pass `--no-camera-preview` for headless operation):
+
+```powershell
+\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
+  --scenario "Emergency vehicle approaching" --duration 20
+```
+
+To keep a camera scenario running until you close the DriveMind camera preview,
+pass `--continuous` instead of `--duration`:
+
+```powershell
+\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
+  --scenario "Approaching ambulance" --continuous
+```
+
+Closing the preview or pressing Ctrl+C stops the run, restores CARLA's original
+settings, and saves the telemetry collected so far.
+
+The CARLA runner also provides repeatable visual cases: `Approaching ambulance`,
+`Police vehicle crossing intersection`, `Fire truck ahead`, `Ordinary vehicle
+negative control`, `Partially occluded emergency vehicle`, and `Low-confidence
+false-positive case`. Run any case by passing its exact name to `--scenario`.
+The low-confidence case is a normal Audi scene; whether it produces a low score
+or no detection depends on the trained model and confidence threshold. The
+police case searches for a perpendicular junction approach and logs a fallback
+if the selected map location has none. Ground-truth actor type/light fields in
+the saved CARLA JSON are for later evaluation only.
+
+The CARLA window shows actual predicted boxes and confidence scores, checkpoint
+status, detector latency/FPS, emergency count, risk, and planner action. Without
+the trained checkpoint, the panel explicitly shows `UNTRAINED` and no boxes.
+
 Data pipeline for the DriveMind self-driving simulation project. It turns two raw
 data sources into validated, ML-ready feature tables:
 

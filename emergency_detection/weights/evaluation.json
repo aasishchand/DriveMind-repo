@@ -1,0 +1,97 @@
+{
+  "status": "evaluated",
+  "precision": 0.16747892105889575,
+  "recall": 0.8539124880229958,
+  "map50": 0.715763089830634,
+  "map50_95": 0.4683351930446967,
+  "per_class": {
+    "ambulance": {
+      "ground_truth_count": 1403,
+      "predictions": 6486,
+      "precision": 0.2062904717853839,
+      "recall": 0.9536707056307911,
+      "ap50": 0.7069501314181392,
+      "ap50_95": 0.529820184226107
+    },
+    "fire_truck": {
+      "ground_truth_count": 1249,
+      "predictions": 5735,
+      "precision": 0.2085440278988666,
+      "recall": 0.9575660528422738,
+      "ap50": 0.8473205260042372,
+      "ap50_95": 0.5773856197273128
+    },
+    "police_vehicle": {
+      "ground_truth_count": 1066,
+      "predictions": 6602,
+      "precision": 0.15237806725234776,
+      "recall": 0.9437148217636022,
+      "ap50": 0.6799593462465984,
+      "ap50_95": 0.4853776701032312
+    },
+    "ordinary_vehicle": {
+      "ground_truth_count": 11937,
+      "predictions": 60996,
+      "precision": 0.16112531969309463,
+      "recall": 0.8233224428248304,
+      "ap50": 0.6288223556535613,
+      "ap50_95": 0.2807572981221357
+    }
+  },
+  "iou_thresholds": [
+    0.5,
+    0.55,
+    0.6,
+    0.65,
+    0.7,
+    0.75,
+    0.8,
+    0.85,
+    0.9,
+    0.95
+  ],
+  "confusion_matrix_labels": [
+    "background",
+    "ambulance",
+    "fire_truck",
+    "police_vehicle",
+    "ordinary_vehicle"
+  ],
+  "confusion_matrix": [
+    [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      5213,
+      1338,
+      0,
+      0,
+      0
+    ],
+    [
+      4592,
+      0,
+      1196,
+      0,
+      0
+    ],
+    [
+      5656,
+      0,
+      0,
+      1006,
+      0
+    ],
+    [
+      53277,
+      0,
+      0,
+      0,
+      9828
+    ]
+  ]
+}

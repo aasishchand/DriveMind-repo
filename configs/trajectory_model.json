@@ -1,0 +1,30 @@
+{
+  "model_name": "DriveMind LSTM Trajectory Predictor",
+  "model_type": "LSTM",
+  "gold_path": "data/gold/carla_telemetry/trajectory_windows.parquet",
+  "train_scenarios": [
+    "drivemind_carla_controlled",
+    "drivemind_carla_smoke",
+    "drivemind_carla_train_normal"
+  ],
+  "validation_scenarios": [
+    "drivemind_carla_validation_obstacle"
+  ],
+  "test_scenarios": [
+    "drivemind_carla_test_slow"
+  ],
+  "input_steps": 20,
+  "future_steps": 30,
+  "sample_rate_hz": 20,
+  "prediction_horizons_seconds": [1.0, 1.5],
+  "input_size": 5,
+  "hidden_size": 48,
+  "num_layers": 1,
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "max_epochs": 40,
+  "early_stopping_patience": 7,
+  "minimum_samples": 20,
+  "torch_threads": 2,
+  "seed": 41
+}
