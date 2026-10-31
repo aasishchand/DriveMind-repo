@@ -1,4 +1,4 @@
-# DriveMind - ETL (Member 1: Data Engineering & ETL)
+# DriveMind
 
 ## 2D autonomous driving demo
 
