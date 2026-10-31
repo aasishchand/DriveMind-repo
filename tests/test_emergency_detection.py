@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from emergency_detection.inference import EmergencyDetector
+from emergency_detection.inference import EmergencyDetector, draw_detections
 from emergency_detection.labels import CLASS_NAMES, CLASS_TO_ID, normalize_label
 from emergency_detection.tracking import DetectionTracker, estimate_distance_ttc
 from emergency_detection.evaluate import evaluate_model
@@ -13,6 +13,16 @@ CAMERA_SCENARIOS = {
     "Ordinary vehicle negative control", "Partially occluded emergency vehicle",
     "Low-confidence false-positive case",
 }
+
+
+def test_draw_detections_renders_boxes_without_changing_source():
+    source = np.zeros((48, 64, 3), dtype=np.uint8)
+    result = draw_detections(source, [{"class": "ambulance", "confidence": 0.9,
+                                       "bbox": [10, 20, 40, 40]}])
+    assert result.shape == source.shape
+    assert result.dtype == source.dtype
+    assert result.any()
+    assert not source.any()
 
 
 def test_dedicated_detector_is_explicitly_untrained_without_checkpoint(tmp_path):
@@ -57,11 +67,21 @@ def test_tracker_and_relative_motion_estimate():
     first = tracker.update([{"class": "ambulance", "confidence": .8, "bbox": [100, 100, 180, 180]}])
     previous = {}
     estimate_distance_ttc(first[0], 1280, 720, 90, .1, previous)
-    second = tracker.update([{"class": "ambulance", "confidence": .9, "bbox": [102, 110, 182, 200]}])
+    second = tracker.update([{"class": "ambulance", "confidence": .9, "bbox": [102, 110, 182, 198]}])
     motion = estimate_distance_ttc(second[0], 1280, 720, 90, .1, previous)
     assert first[0]["track_id"] == second[0]["track_id"]
     assert motion["distance_m"] > 0
     assert motion["closing_speed_mps"] is not None
+
+
+def test_implausible_camera_range_jump_is_not_sent_to_planner():
+    previous = {}
+    detection = {"track_id": 1, "bbox": [100, 100, 180, 180]}
+    estimate_distance_ttc(detection, 1280, 720, 90, .1, previous)
+    detection["bbox"] = [102, 110, 182, 200]
+    motion = estimate_distance_ttc(detection, 1280, 720, 90, .1, previous)
+    assert motion["closing_speed_mps"] is None
+    assert motion["ttc_s"] is None
 
 
 def test_camera_emergency_actor_reaches_risk_planner_without_forced_maneuver():

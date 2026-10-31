@@ -74,3 +74,8 @@ vel_x, vel_y, vel_z, yaw_deg, lane_id, blueprint_id, emergency_light_on
 `actor_id` is `"ego"` for the ego vehicle (matches the common schema's
 `vehicle_id == "ego"` convention used throughout `clean_carla`) and
 `"veh_<carla_actor_id>"` for everything else.
+
+For lane-choice demonstrations, use the separate Traffic Manager expert
+collector described in [the policy-learning notes](../etl/policy_learning/README.md).
+It records lane-change labels and control values in a policy CSV without
+changing this ETL capture schema.

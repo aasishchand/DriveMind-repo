@@ -51,11 +51,8 @@ class Dashboard:
         self._build()
         self._new_log()
         self.root.bind("<space>", lambda _e: self.toggle_pause())
-        self.root.bind("<Key-1>", lambda _e: self.select_scenario(0))
-        self.root.bind("<Key-2>", lambda _e: self.select_scenario(1))
-        self.root.bind("<Key-3>", lambda _e: self.select_scenario(2))
-        self.root.bind("<Key-4>", lambda _e: self.select_scenario(3))
-        self.root.bind("<Key-5>", lambda _e: self.select_scenario(4))
+        for index in range(min(len(SCENARIOS), 9)):
+            self.root.bind(f"<Key-{index+1}>", lambda _e, i=index: self.select_scenario(i))
         self._tick()
         self.run_eval()
 
@@ -81,7 +78,7 @@ class Dashboard:
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _e: self.draw())
         foot = tk.Frame(left, bg=BG); foot.pack(fill="x", pady=(5,0))
-        tk.Label(foot, text="Keys  1–5 scenarios   •   Space pause/resume", fg=MUTED, bg=BG,
+        tk.Label(foot, text=f"Keys  1–{min(len(SCENARIOS), 9)} scenarios   •   Space pause/resume", fg=MUTED, bg=BG,
                  font=("Segoe UI",9)).pack(side="left")
         self.log_label = tk.Label(foot, text="", fg=MUTED, bg=BG, font=("Segoe UI",8))
         self.log_label.pack(side="right")
@@ -108,7 +105,7 @@ class Dashboard:
         tk.Label(header, text="PLANNER COMPARISON", fg=CYAN, bg=PANEL, font=("Segoe UI",9,"bold")).pack(side="left")
         self._button(header, "Run experiments", self.run_eval, small=True).pack(side="right")
         self.chart = tk.Canvas(exp, bg="#0e1626", height=118, highlightthickness=0); self.chart.pack(fill="x", padx=9)
-        self.table = tk.Label(exp, text="Run experiments for measured results across all 5 scenarios.",
+        self.table = tk.Label(exp, text=f"Run experiments for measured results across all {len(SCENARIOS)} scenarios.",
                               fg=MUTED, bg=PANEL, justify="left", anchor="nw", font=("Consolas",8), wraplength=320)
         self.table.pack(fill="both", expand=True, padx=10, pady=8)
         self.status = tk.Label(self.root, text="", fg=MUTED, bg="#080d18", anchor="w", font=("Segoe UI",8))
@@ -295,13 +292,15 @@ class Dashboard:
             self.ml_chart.create_text(width-92,8,anchor="nw",text="CV / LSTM",fill=WHITE,font=("Segoe UI",7,"bold"))
 
     def run_eval(self):
-        self.status.configure(text="Running 15 comparable experiments (5 scenarios × 3 planners)…")
+        self.status.configure(text=f"Running {len(SCENARIOS)*len(MODES)} comparable experiments "
+                                   f"({len(SCENARIOS)} scenarios × {len(MODES)} planners)…")
         self.root.update_idletasks()
         self.experiment_rows = run_experiments()
         path, _json_path = write_evaluations(self.experiment_rows)
         # Display aggregates measured from all matched runs.
-        aggregate={m:sum(r["average_risk"] for r in self.experiment_rows if r["mode"]==m)/5 for m in MODES}
-        self.chart.delete("all"); self.chart.create_text(8,8,anchor="nw",text="Mean risk score across the same five scenarios",fill=MUTED,font=("Segoe UI",8))
+        aggregate={m:sum(r["average_risk"] for r in self.experiment_rows if r["mode"]==m)
+                   /sum(r["mode"]==m for r in self.experiment_rows) for m in MODES}
+        self.chart.delete("all"); self.chart.create_text(8,8,anchor="nw",text=f"Mean risk score across the same {len(SCENARIOS)} scenarios",fill=MUTED,font=("Segoe UI",8))
         colors=["#7c8da6", "#54a7df", CYAN]
         for i,m in enumerate(MODES):
             x=25+i*100; val=aggregate[m]; bh=70*val/100

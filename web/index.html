@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#09111d">
+  <title>DriveMind | Simulation Control</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="root"><p class="startup">Loading DriveMind dashboard…</p></div>
+  <script>
+    window.addEventListener("error", function (event) {
+      var root = document.getElementById("root");
+      if (root && root.querySelector(".startup")) {
+        root.textContent = "Dashboard failed to load: " + (event.message || "React runtime unavailable");
+      }
+    });
+  </script>
+  <script src="/vendor/react.production.min.js" onerror="document.getElementById('root').textContent='Could not load the local React runtime.'"></script>
+  <script src="/vendor/react-dom.production.min.js" onerror="document.getElementById('root').textContent='Could not load the local React DOM runtime.'"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

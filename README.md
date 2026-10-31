@@ -2,6 +2,47 @@
 
 ## 2D autonomous driving demo
 
+### Browser control panel
+
+DriveMind includes a local browser dashboard for starting and controlling the
+2D simulation. It streams scenario telemetry into a live road view, risk and
+vehicle-state cards, and a run-history chart. The page can also launch the
+existing Python/Tkinter dashboard in a separate window. The web service uses
+Python's standard library and binds to `127.0.0.1` only.
+
+Start it from the repository root:
+
+```powershell
+.\.venv-carla\Scripts\python.exe -m etl.webapp
+```
+
+Open <http://127.0.0.1:8765>. Choose a scenario and planner, then select
+**Start simulation**. Use Pause, Reset, or Stop to control the browser
+simulation. **Open desktop dashboard** launches the existing Tkinter app.
+Browser-run telemetry is saved as CSV under `data/simulation/telemetry/`.
+The frontend uses React and is served locally with the Python API; Node.js and
+npm are not required. Press Ctrl+C in the server terminal to stop the web
+service.
+
+### CARLA from the browser
+
+The CARLA control panel can launch a packaged Windows `CarlaUE4.exe` when its
+path is supplied, or connect to a CARLA server started separately. Set the
+RPC port to match the server, then start a scenario and planner run from the
+page. The app can stop its own CARLA server and DriveMind client run; it does
+not stop a server started outside the app. The client uses
+`.venv-carla\Scripts\python.exe` (override with `DRIVEMIND_CARLA_PYTHON`),
+which must have the CARLA Python API installed. Runner and server logs are
+saved under `data/simulation/telemetry/`. During a web-launched CARLA run, the
+control panel displays the ego vehicle's front and rear RGB camera feeds.
+Runs continue until stopped by default; clear **Keep running until Stop is
+pressed** to use a fixed duration. A physical collision brakes the ego vehicle
+while the camera feed and simulation telemetry continue until the run is stopped.
+
+The browser simulation uses the same synthetic 2D engine as `main.py`; it does
+not provide camera perception or real-world safety evidence. CARLA remains a
+separate optional workflow described below.
+
 The repository now also includes a dependency-free Tkinter demonstration that
 connects a simulation-aware perception baseline to constant-velocity
 prediction, TTC/risk scoring, planner decisions, and a speed/lane controller.
@@ -11,7 +52,7 @@ does not claim camera-based perception or real-world safety performance.
 Launch it from the repository root:
 
 ```powershell
-\.venv-carla\Scripts\python.exe main.py
+.\.venv-carla\Scripts\python.exe main.py
 ```
 
 This installed Python 3.12 environment already includes Tkinter; the demo
@@ -21,7 +62,7 @@ When the CARLA 0.9.16 server is running, launch the planner against the real
 CARLA world with the same environment:
 
 ```powershell
-\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
+.\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
   --scenario "Emergency vehicle approaching" --duration 10
 ```
 
@@ -33,9 +74,9 @@ Bronze and Silver loaders, then rebuild Gold as shown in
 [scripts/README.md](scripts/README.md). The Tk dashboard stays available as a
 lightweight 2D view.
 
-Choose one of five scenarios and one of three planners in the window. Start,
-Pause, Reset, or press `1`–`5` to switch scenarios and Space to pause/resume.
-Run experiments compares all three modes over the same five seeded scenarios;
+Choose one of seven scenarios and one of three planners in the window. Start,
+Pause, Reset, or press `1`–`7` to switch scenarios and Space to pause/resume.
+Run experiments compares all three modes over the same seven seeded scenarios;
 the measured CSV and JSON reports are written under
 `data/simulation/evaluation/`. Live run telemetry is saved as CSV under
 `data/simulation/telemetry/`. These simulation CSVs remain separate from the
@@ -89,9 +130,9 @@ vehicles, and ITAWD Indian-road scenes. Install the dataset dependencies, set
 YOLOv8 exports:
 
 ```powershell
-\.venv-carla\Scripts\python.exe -m pip install roboflow pyyaml
+.\.venv-carla\Scripts\python.exe -m pip install roboflow pyyaml
 $env:ROBOFLOW_API_KEY = "your Roboflow API key"
-\.venv-carla\Scripts\python.exe -m emergency_detection.download_roboflow
+.\.venv-carla\Scripts\python.exe -m emergency_detection.download_roboflow
 ```
 
 Exports are saved under `data/datasets/` (ignored by Git). The merger reads
@@ -104,7 +145,7 @@ or trained weights.
 Combine the three exports into DriveMind's canonical YOLO labels:
 
 ```powershell
-\.venv-carla\Scripts\python.exe -m emergency_detection.combine_roboflow `
+.\.venv-carla\Scripts\python.exe -m emergency_detection.combine_roboflow `
   --emergency data\datasets\emergency-vehicles `
   --vehicles data\datasets\general-vehicles `
   --itawd data\datasets\itawd `
@@ -120,7 +161,7 @@ boxes. Training applies horizontal flips and color augmentation.
 ### Train, evaluate, and run
 
 ```powershell
-\.venv-carla\Scripts\python.exe -m emergency_detection.train --data data\datasets\drivemind-emergency `
+.\.venv-carla\Scripts\python.exe -m emergency_detection.train --data data\datasets\drivemind-emergency `
   --epochs 20 --batch-size 2
 ```
 
@@ -134,7 +175,7 @@ Run CARLA with the live annotated RGB camera window (close it to stop the
 preview, or pass `--no-camera-preview` for headless operation):
 
 ```powershell
-\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
+.\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
   --scenario "Emergency vehicle approaching" --duration 20
 ```
 
@@ -142,14 +183,14 @@ To keep a camera scenario running until you close the DriveMind camera preview,
 pass `--continuous` instead of `--duration`:
 
 ```powershell
-\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
+.\.venv-carla\Scripts\python.exe -m etl.simulation.carla_demo `
   --scenario "Approaching ambulance" --continuous
 ```
 
 Closing the preview or pressing Ctrl+C stops the run, restores CARLA's original
 settings, and saves the telemetry collected so far.
 
-The CARLA runner also provides repeatable visual cases: `Approaching ambulance`,
+The CARLA runner also provides repeatable visual cases: `Dense traffic lane changes`, `Approaching ambulance`, `Four emergency vehicles`,
 `Police vehicle crossing intersection`, `Fire truck ahead`, `Ordinary vehicle
 negative control`, `Partially occluded emergency vehicle`, and `Low-confidence
 false-positive case`. Run any case by passing its exact name to `--scenario`.
@@ -162,6 +203,26 @@ the saved CARLA JSON are for later evaluation only.
 The CARLA window shows actual predicted boxes and confidence scores, checkpoint
 status, detector latency/FPS, emergency count, risk, and planner action. Without
 the trained checkpoint, the panel explicitly shows `UNTRAINED` and no boxes.
+
+## Policy-learning proof of concept
+
+Build the shared action/outcome table from available DriveMind CARLA runs:
+
+```powershell
+.\.venv-carla\Scripts\python.exe -m etl.policy_learning.prepare_experiences
+```
+
+The output is `data/policy_learning/experiences.csv` and stays local. The table
+keeps actions, camera detections, near misses, and collision outcomes together.
+LEAD expert routes and CarlAnomaly event labels can be added as schema-v1 CSVs
+with `--normalized-input`; their full datasets are not downloaded by this step.
+See [the policy-learning notes](etl/policy_learning/README.md) for source roles
+and limits. The offline risk shield needs at least three independent collision
+runs and three clear runs, then five paired CARLA episodes before it can be
+promoted. Until it passes those gates, the existing planner remains active.
+The separate lane-choice model uses Traffic Manager demonstrations and is
+described in the policy-learning notes; it trains target-lane choices while
+keeping the waypoint steering controller in charge of wheel steering.
 
 Data pipeline for the DriveMind self-driving simulation project. It turns two raw
 data sources into validated, ML-ready feature tables:

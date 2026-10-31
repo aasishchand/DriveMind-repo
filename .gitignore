@@ -20,6 +20,7 @@ data/_manifest/**
 data/datasets/**
 data/simulation/telemetry/**
 data/simulation/evaluation/**
+data/policy_learning/**
 !data/**/.gitkeep
 
 # Local IDD / CARLA source drops

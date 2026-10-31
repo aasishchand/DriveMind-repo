@@ -3,7 +3,7 @@ import math
 import unittest
 
 from etl.simulation.core import (Actor, DrivingSimulation, assess_risk, calculate_ttc,
-                                 predict_position, run_experiments)
+                                 predict_position, run_experiments, SCENARIOS, MODES)
 
 
 class SimulationCoreTests(unittest.TestCase):
@@ -46,18 +46,49 @@ class SimulationCoreTests(unittest.TestCase):
         self.assertEqual(emergency.collision_count, 0)
         self.assertEqual(emergency.near_miss_count, 0)
         reference = DrivingSimulation("Emergency vehicle approaching", "BASELINE")
-        for _ in range(250):
+        self.assertIn("YIELD", reference.step().action)
+        for _ in range(249):
             reference.step()
-        self.assertGreater(reference.collision_count, 0)
+        self.assertEqual(reference.collision_count, 0)
         obstacle = DrivingSimulation("Obstacle ahead", "RISK-AWARE")
         obstacle.step()
         self.assertEqual(obstacle.ego_lane, 1)
 
+
     def test_experiment_grid_is_comparable_and_measured(self):
         rows = run_experiments(duration=0.5)
-        self.assertEqual(len(rows), 15)
+        self.assertEqual(len(rows), len(SCENARIOS) * len(MODES))
+        self.assertEqual({(row["scenario"], row["mode"]) for row in rows},
+                         {(scenario, mode) for scenario in SCENARIOS for mode in MODES})
         self.assertEqual({row["mode"] for row in rows}, {"BASELINE", "RISK-AWARE", "DRIVEMIND"})
         self.assertTrue(all(row["ticks"] == 5 for row in rows))
+
+    def test_learned_risk_does_not_weaken_imminent_braking(self):
+        class HighRiskModel:
+            threshold = 0.5
+
+            def probability(self, features):
+                return 1.0
+
+        sim = DrivingSimulation("Normal traffic", "RISK-AWARE",
+                                risk_model=HighRiskModel(), lane_model=False)
+        sim.actors = [Actor("ahead", "car", 9, 0, 0),
+                      Actor("adjacent", "car", 8, 0, 1)]
+        sim.risk_probability_ema = 1.0
+        sim.risk_shield_active = True
+        before = sim.ego_speed
+        row = sim.step(0.1)
+        self.assertEqual(row.action, "BRAKE")
+        self.assertAlmostEqual(before - sim.ego_speed, 0.7)
+
+    def test_matched_speed_is_not_reported_as_active_braking(self):
+        sim = DrivingSimulation("Normal traffic", "DRIVEMIND", risk_model=False, lane_model=False)
+        sim.ego_speed = 14.0 + 1e-12
+        sim.actors = [Actor("ahead", "car", 8.0, 14.0, 0),
+                      Actor("adjacent", "car", 8.0, 14.0, 1)]
+        row = sim.step()
+        self.assertEqual(row.action, "FOLLOW VEHICLE")
+        self.assertAlmostEqual(row.brake, 0.0)
 
 
 if __name__ == "__main__":

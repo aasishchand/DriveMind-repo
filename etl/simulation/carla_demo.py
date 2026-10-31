@@ -16,11 +16,13 @@ import itertools
 from io import BytesIO
 import json
 import math
+import os
 import queue
 from datetime import datetime
 from pathlib import Path
 import random
 import signal
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -29,6 +31,9 @@ import carla
 from etl.config import REPO_ROOT
 from etl.prediction.inference import TrajectoryPredictor
 from etl.simulation.core import Actor, DrivingSimulation, MODES, SCENARIOS, telemetry_dict
+from etl.policy_learning.risk_model import CollisionRiskModel
+from etl.policy_learning.lane_model import LaneChoiceModel
+from etl.policy_learning.steering_model import SteeringModel
 from emergency_detection.inference import EmergencyDetector
 from emergency_detection.tracking import DetectionTracker, estimate_distance_ttc
 
@@ -36,6 +41,16 @@ from emergency_detection.tracking import DetectionTracker, estimate_distance_ttc
 DT = 0.05
 TM_PORT = 8000
 STOP_REQUESTED = False
+
+
+def _finite_json(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _finite_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_json(item) for item in value]
+    return value
 EMERGENCY_BITS = int(carla.VehicleLightState.Special1) | int(carla.VehicleLightState.Special2)
 CAMERA_SCENARIOS = (
     "Approaching ambulance", "Police vehicle crossing intersection", "Fire truck ahead",
@@ -62,7 +77,7 @@ class CameraPreview:
         except Exception:
             self.root = None
 
-    def show(self, frames, detections, detector, telemetry=None):
+    def show(self, frames, detections, detector, telemetry=None, sim_truth=()):
         if self.root is None:
             return
         try:
@@ -99,8 +114,11 @@ class CameraPreview:
             action = telemetry.action if telemetry else "—"
             timing = (f"{detector.latency_ms:.1f} ms | {1000/max(1.0, detector.latency_ms):.1f} FPS"
                       if detector.status == "READY" else "latency — | FPS —")
+            truth_text = ("CARLA SIM GROUND TRUTH (not vision): " + ", ".join(sim_truth)
+                          if sim_truth else "CARLA SIM GROUND TRUTH: no emergency actors")
             self.status.configure(text=f"{detector.status} | {detector.__class__.__name__} | "
-                f"{len(emergency)} emergency vehicles | {timing} | Risk {risk} | Planner: {action}\n{details}")
+                f"{len(emergency)} emergency vehicles | {timing} | Risk {risk} | Planner: {action}\n"
+                f"{details}\n{truth_text}")
             self.root.update_idletasks()
             self.root.update()
         except tk.TclError as exc:
@@ -126,6 +144,9 @@ def _next(wp, distance: float, *, backwards: bool = False):
 def _driving_neighbor(wp, direction: str):
     candidate = wp.get_right_lane() if direction == "right" else wp.get_left_lane()
     if candidate and candidate.lane_type == carla.LaneType.Driving:
+        yaw_delta = abs((candidate.transform.rotation.yaw-wp.transform.rotation.yaw+180) % 360-180)
+        if yaw_delta > 45.0:
+            return None
         return candidate
     return None
 
@@ -152,6 +173,34 @@ def _choose_start(world, *, junction_ahead: bool = False):
         ):
             return wp
     raise RuntimeError("could not find a CARLA spawn point with 45m of road and an adjacent lane")
+
+
+def _choose_straight_start(world, length: float = 100.0, behind: float = 0.0):
+    """Find a long, non-junction stretch suitable for repeated lane changes."""
+    carla_map = world.get_map()
+    points = list(carla_map.get_spawn_points())
+    random.shuffle(points)
+    for transform in points:
+        wp = carla_map.get_waypoint(transform.location, project_to_road=True)
+        if not wp or wp.is_junction or not (_driving_neighbor(wp, "left") or _driving_neighbor(wp, "right")):
+            continue
+        if behind and not _next(wp, behind, backwards=True):
+            continue
+        start_yaw = wp.transform.rotation.yaw
+        straight = True
+        for distance in range(10, int(length) + 1, 10):
+            candidate = _next(wp, distance)
+            if not candidate or candidate.is_junction:
+                straight = False
+                break
+            yaw_delta = abs((candidate.transform.rotation.yaw-start_yaw+180) % 360-180)
+            if yaw_delta > 12 or not (_driving_neighbor(candidate, "left") or
+                                      _driving_neighbor(candidate, "right")):
+                straight = False
+                break
+        if straight:
+            return wp
+    raise RuntimeError(f"could not find {length:.0f}m of straight road with an adjacent lane")
 
 
 def _crossing_approach(world_map, start_wp):
@@ -210,7 +259,10 @@ def _relative_state(ego, actors, lane0_id, lane1_id):
 
 def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
         scenario: str = "Emergency vehicle approaching", mode: str = "DRIVEMIND",
-        seed: int = 41, camera_preview: bool = True) -> tuple[Path, Path, dict]:
+        seed: int = 41, camera_preview: bool = True, risk_model=None,
+        lane_model=None, steering_model=None, stop_file: Path | None = None,
+        pause_file: Path | None = None,
+        web_frame_dir: Path | None = None) -> tuple[Path, Path, dict]:
     random.seed(seed)
     client = carla.Client(host, port)
     client.set_timeout(10.0)
@@ -234,7 +286,17 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
     try:
         bp_lib = world.get_blueprint_library()
         junction_case = scenario == "Police vehicle crossing intersection"
-        start_wp = _choose_start(world, junction_ahead=junction_case)
+        if scenario == "Four emergency vehicles":
+            base_wp = _choose_straight_start(world, length=100.0, behind=190.0)
+            # Begin beyond the initial spawn area so fixed roadside map props
+            # near the CARLA spawn point do not sit directly in the demo path.
+            start_wp = _next(base_wp, 50.0) or base_wp
+        elif junction_case:
+            start_wp = _choose_start(world, junction_ahead=True)
+        else:
+            # The regular spawn-point selector can choose a tight curved road;
+            # those are a poor fit for this demo's lane-change controller.
+            start_wp = _choose_straight_start(world, length=100.0)
         adjacent = _driving_neighbor(start_wp, "right")
         adjacent_direction = "right"
         if adjacent is None:
@@ -254,7 +316,8 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
 
         def spawn_at(distance: float, lane_wp, actor_name: str, *, emergency=False, obstacle=False,
                      slower=False, vehicle_type: str | None = None):
-            target = lane_wp if distance <= 0 else _next(lane_wp, distance)
+            target = lane_wp if distance == 0 else _next(
+                lane_wp, abs(distance), backwards=distance < 0)
             if target is None:
                 return
             bp_pattern = vehicle_type or ("vehicle.carlamotors.firetruck" if emergency else "vehicle.audi.a2")
@@ -269,9 +332,11 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
             if not obstacle:
                 actor.set_autopilot(True, TM_PORT)
                 if slower:
-                    tm.vehicle_percentage_speed_difference(actor, 45.0)
+                    speed_difference = 20.0 if scenario == "Dense traffic lane changes" else 45.0
+                    tm.vehicle_percentage_speed_difference(actor, speed_difference)
                 if emergency:
-                    tm.vehicle_percentage_speed_difference(actor, -20.0)
+                    speed_difference = -80.0 if scenario == "Four emergency vehicles" else -70.0
+                    tm.vehicle_percentage_speed_difference(actor, speed_difference)
                     try:
                         actor.set_light_state(carla.VehicleLightState(EMERGENCY_BITS))
                     except Exception:
@@ -282,7 +347,9 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
         if scenario in ("Emergency vehicle approaching", "Approaching ambulance"):
             # Give perception and planning more time to recognize the siren
             # vehicle and clear a safe passing gap before it reaches the ego.
-            previous = _next(start_wp, 85, backwards=True)
+            # Bring the emergency actor into view sooner while leaving enough
+            # room for detection and a controlled lane-clear maneuver.
+            previous = _next(start_wp, 55, backwards=True)
             if previous:
                 vehicle_type = "vehicle.ford.ambulance" if scenario == "Approaching ambulance" else "vehicle.carlamotors.firetruck"
                 bp = bp_lib.find(vehicle_type)
@@ -290,7 +357,7 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
                 if emergency_actor:
                     spawned.append(emergency_actor)
                     emergency_actor.set_autopilot(True, TM_PORT)
-                    tm.vehicle_percentage_speed_difference(emergency_actor, -20.0)
+                    tm.vehicle_percentage_speed_difference(emergency_actor, -70.0)
                     try:
                         emergency_actor.set_light_state(carla.VehicleLightState(EMERGENCY_BITS))
                     except Exception:
@@ -325,10 +392,36 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
         elif scenario == "Traffic congestion":
             for i, distance in enumerate((18, 30, 42, 54, 66, 78)):
                 spawn_at(distance, start_wp if i % 2 == 0 else lane1_wp, f"V-{i+1:02d}", slower=True)
+        elif scenario == "Dense traffic lane changes":
+            # Alternating slow traffic creates repeated, spaced opportunities
+            # for the ego to pass between lanes without starting vehicles close
+            # enough to overlap or force an immediate collision.
+            positions = ((20, 0), (38, 1), (56, 0), (74, 1), (92, 0))
+            for i, (distance, lane) in enumerate(positions):
+                spawn_at(distance, start_wp if lane == 0 else lane1_wp,
+                         f"V-{i+1:02d}", slower=True)
+        elif scenario == "Four emergency vehicles":
+            emergency_specs = (
+                (-35, "E-AMBULANCE", "vehicle.ford.ambulance"),
+                (-70, "E-POLICE", "vehicle.dodge.charger_police"),
+                (-105, "E-FIRE", "vehicle.carlamotors.firetruck"),
+                (-140, "E-AMBULANCE-2", "vehicle.ford.ambulance"),
+            )
+            for distance, name, blueprint in emergency_specs:
+                # Keep emergency traffic in the adjacent lane so the faster
+                # vehicles can pass visibly without forcing repeated ego turns.
+                spawn_at(distance, lane1_wp, name, emergency=True, vehicle_type=blueprint)
+            emergency_count = sum(is_emergency for _, _, is_emergency, _ in others)
+            if emergency_count != 4:
+                raise RuntimeError(f"four-emergency scenario spawned {emergency_count}/4 emergency vehicles")
         else:
             spawn_at(44, start_wp, "V-01")
             spawn_at(70, lane1_wp, "V-02")
             spawn_at(98, lane1_wp, "V-03", slower=True)
+
+        print(f"[carla_demo] spawned {sum(is_emergency for _, _, is_emergency, _ in others)} "
+              f"emergency and {sum(not is_emergency for _, _, is_emergency, _ in others)} "
+              f"other traffic actors")
 
         def on_collision(event):
             collision_frames.add(event.frame)
@@ -374,11 +467,15 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
         latest_detection_times = {view: -1.0 for view in camera_frames}
 
         predictor = TrajectoryPredictor(REPO_ROOT/"models"/"trajectory_lstm.pt")
-        planner = DrivingSimulation(scenario, mode, seed=seed, predictor=predictor)
+        planner = DrivingSimulation(scenario, mode, seed=seed, predictor=predictor,
+                                    risk_model=risk_model, lane_model=lane_model)
         planner.actors = []
         planner.ego_lane = 0
         current_lane_id, target_lane_id = lane0, lane0
         lane_ids = {0: lane0, 1: lane1}
+        lane_change_in_progress = False
+        lane_change_cooldown_until = 0.0
+        safety_braking = False
         desired_lane_direction = adjacent_direction
         response_time = None
         collision_sensor = world.spawn_actor(bp_lib.find("sensor.other.collision"), carla.Transform(), attach_to=ego)
@@ -388,21 +485,31 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
         ticks = None if duration is None else round(duration/DT)
         travelled = 0.0
         previous_location = ego.get_location()
+        smoothed_control_target: float | None = None
         near_miss_count = 0
         in_near_miss = False
         min_ttc = math.inf
         risk_sum = 0.0
+        collision_halt = False
         tick_indices = itertools.count() if ticks is None else range(ticks)
         for index in tick_indices:
-            if STOP_REQUESTED:
+            if STOP_REQUESTED or (stop_file is not None and stop_file.exists()):
+                print("[carla_demo] stop requested; saving telemetry and restoring CARLA")
+                break
+            while pause_file is not None and pause_file.exists():
+                if STOP_REQUESTED or (stop_file is not None and stop_file.exists()):
+                    break
+                time.sleep(0.05)
+            if STOP_REQUESTED or (stop_file is not None and stop_file.exists()):
                 print("[carla_demo] stop requested; saving telemetry and restoring CARLA")
                 break
             world.tick()
-            if collision_events:
+            if collision_events and not collision_halt:
                 first = collision_events[0]
                 print("[carla_demo] physical collision with "
-                      f"{first['other_actor_type']} (actor {first['other_actor_id']}); stopping the run")
-                break
+                      f"{first['other_actor_type']} (actor {first['other_actor_id']}); "
+                      "holding ego vehicle stopped while camera feed continues")
+                collision_halt = True
             for camera_view, frame_queue in camera_frames.items():
                 try:
                     new_frame_id, new_frame = frame_queue.get_nowait()
@@ -410,6 +517,20 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
                         continue
                     camera_frame_ids[camera_view], latest_camera_frames[camera_view] = new_frame_id, new_frame
                     latest_detection_times[camera_view] = index*DT
+                    if web_frame_dir is not None:
+                        try:
+                            from PIL import Image
+                            web_frame_dir.mkdir(parents=True, exist_ok=True)
+                            frame_path = web_frame_dir / f"{camera_view}-{new_frame_id}.jpg"
+                            Image.fromarray(new_frame[::2, ::2]).save(frame_path, format="JPEG", quality=78)
+                            if new_frame_id % 20 == 0:
+                                old_frames = sorted(web_frame_dir.glob(f"{camera_view}-*.jpg"),
+                                                    key=lambda item: item.stat().st_mtime, reverse=True)
+                                for old_frame in old_frames[10:]:
+                                    old_frame.unlink(missing_ok=True)
+                        except Exception as exc:
+                            print(f"[carla_demo] web camera frame unavailable: {exc}")
+                            web_frame_dir = None
                     outputs = detection_trackers[camera_view].update(emergency_detector.predict(new_frame))
                     for detection in outputs:
                         detection.update(estimate_distance_ttc(detection, 1280, 720, 90, DT,
@@ -429,12 +550,25 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
             visual_actors = []
             for detection in latest_detections:
                 center_x = sum(detection["bbox"][::2])/2
-                lane = (0 if current_lane_id == lane0 else 1) if detection.get("path_overlap") else (
-                    0 if center_x < 512 else 1 if center_x > 768 else (0 if current_lane_id == lane0 else 1))
-                closing = detection.get("closing_speed_mps") or 0.0
+                current_lane_index = 0 if current_lane_id == lane0 else 1
+                if detection.get("path_overlap"):
+                    lane = current_lane_index
+                else:
+                    camera_side = "left" if center_x < 640 else "right"
+                    if detection.get("camera_view") == "rear":
+                        camera_side = "right" if camera_side == "left" else "left"
+                    if current_lane_index == 0 and camera_side == desired_lane_direction:
+                        lane = 1
+                    elif current_lane_index == 1 and camera_side != desired_lane_direction:
+                        lane = 0
+                    else:
+                        # The camera may see a vehicle in a third lane or off
+                        # the ego's two-lane planning corridor; don't mislabel it.
+                        continue
                 distance = detection["distance_m"] * (-1 if detection["camera_view"] == "rear" else 1)
                 closing = detection.get("closing_speed_mps") or 0.0
                 longitudinal_speed = ego_speed + closing if detection["camera_view"] == "rear" else ego_speed-closing
+                longitudinal_speed = max(0.0, min(25.0, longitudinal_speed))
                 visual_actors.append(Actor(f"camera-{detection['camera_view']}-{detection['track_id']}",
                     "emergency" if detection["class"] in ("ambulance", "fire_truck", "police_vehicle") else "car",
                     distance, longitudinal_speed, lane,
@@ -446,7 +580,11 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
             planner.actors = [actor for actor, _ in observed]
             telemetry = planner.step(DT)
             if preview is not None and any(frame is not None for frame in latest_camera_frames.values()):
-                preview.show(latest_camera_frames, latest_detections, emergency_detector, telemetry)
+                sim_truth = [f"{name}={('ambulance' if 'ambulance' in actor.type_id else 'fire truck' if 'firetruck' in actor.type_id else 'police vehicle')}"
+                             for name, actor, is_emergency, _ in others
+                             if is_emergency and actor.is_alive]
+                preview.show(latest_camera_frames, latest_detections, emergency_detector,
+                             telemetry, sim_truth)
                 if preview.closed_by_user:
                     print("[carla_demo] camera preview closed; stopping continuous run")
                     break
@@ -466,10 +604,27 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
             if telemetry.action != "MAINTAIN SPEED" and response_time is None:
                 response_time = index*DT
 
-            requested_lane_id = lane_ids.get(telemetry.ego_lane, current_lane_id)
-            if requested_lane_id != target_lane_id:
-                target_lane_id = requested_lane_id
             current_wp = carla_map.get_waypoint(ego.get_location(), project_to_road=True)
+            sim_time = index*DT
+            if current_wp and current_wp.lane_id in lane_ids.values():
+                current_lane_id = current_wp.lane_id
+            if lane_change_in_progress and current_lane_id == target_lane_id:
+                lane_change_in_progress = False
+                lane_change_cooldown_until = sim_time + 3.0
+            requested_lane_id = lane_ids.get(telemetry.ego_lane, current_lane_id)
+            # Commit to each maneuver until the ego reaches the target lane.
+            # Planner lane requests can oscillate while a vehicle is crossing.
+            if (not lane_change_in_progress and sim_time >= lane_change_cooldown_until
+                    and requested_lane_id != current_lane_id):
+                candidate = _driving_neighbor(current_wp, desired_lane_direction) if current_wp else None
+                if candidate is None or candidate.lane_id != requested_lane_id:
+                    opposite = "left" if desired_lane_direction == "right" else "right"
+                    candidate = _driving_neighbor(current_wp, opposite) if current_wp else None
+                if candidate and candidate.lane_id == requested_lane_id:
+                    target_lane_id = requested_lane_id
+                    lane_change_in_progress = True
+            if not lane_change_in_progress:
+                target_lane_id = current_lane_id
             target_wp = current_wp
             if current_wp and target_lane_id != current_wp.lane_id:
                 neighbor = _driving_neighbor(current_wp, desired_lane_direction)
@@ -478,24 +633,105 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
                     neighbor = _driving_neighbor(current_wp, opposite)
                 if neighbor and neighbor.lane_id == target_lane_id:
                     target_wp = neighbor
-            if current_wp and current_wp.lane_id in lane_ids.values():
-                current_lane_id = current_wp.lane_id
 
-            ahead = _next(target_wp, 8.0) if target_wp else None
+            lookahead = max(8.0, min(18.0, 6.0+ego_speed*1.2))
+            ahead = _next(target_wp, lookahead) if target_wp else None
             steer = 0.0
-            if ahead:
+            # The steering demonstrations were collected with lane changes
+            # disabled. Keep the learned controller in-distribution: use it
+            # for lane keeping, and use waypoint geometry during a lane change.
+            if (steering_model is not None and target_wp and not lane_change_in_progress
+                    and sim_time >= lane_change_cooldown_until):
+                steer = steering_model.predict(ego, target_wp, carla_map)
+            elif ahead:
                 origin = ego.get_location()
                 target_loc = ahead.transform.location
                 yaw_now = math.radians(ego.get_transform().rotation.yaw)
                 yaw_target = math.atan2(target_loc.y-origin.y, target_loc.x-origin.x)
                 delta_yaw = (yaw_target-yaw_now+math.pi) % (2*math.pi)-math.pi
-                steer = max(-1.0, min(1.0, delta_yaw/math.radians(35)))
-            speed_error = telemetry.target_speed-ego_speed
-            throttle = max(0.0, min(0.75, speed_error*0.22))
-            brake = max(0.0, min(1.0, -speed_error*0.24))
-            ego.apply_control(carla.VehicleControl(throttle=throttle, brake=brake, steer=steer))
+                steer = max(-1.0, min(1.0, delta_yaw/math.radians(55)))
+            if target_wp:
+                # Heading-only steering drifts toward the edge on long curves.
+                # Correct toward the selected lane center as well.
+                location = ego.get_location()
+                lane_center = target_wp.transform.location
+                right = target_wp.transform.get_right_vector()
+                lateral_error = ((location.x-lane_center.x)*right.x
+                                 + (location.y-lane_center.y)*right.y)
+                steer -= lateral_error*0.04
+            steer = max(-0.3, min(0.3, steer))
+            control_target_speed = telemetry.target_speed
+            throttle_limit = 0.75
+            if scenario in ("Dense traffic lane changes", "Four emergency vehicles"):
+                # Keep closing speed modest so repeated passes remain visible
+                # and the traffic manager has room to react around the ego.
+                control_target_speed = min(control_target_speed,
+                                           6.5 if scenario == "Four emergency vehicles" else 11.0)
+                throttle_limit = 0.4
+            # Keep the packaged simulator demo at a moderate, controllable speed.
+            control_target_speed = min(control_target_speed, 10.0)
+            if smoothed_control_target is None:
+                smoothed_control_target = control_target_speed
+            else:
+                # Rate-limit routine target changes to avoid stop/start motion
+                # when risk estimates or lane requests fluctuate between ticks.
+                target_rate = 6.0 if telemetry.action == "BRAKE" else 1.8
+                max_step = target_rate * DT
+                change = control_target_speed-smoothed_control_target
+                smoothed_control_target += max(-max_step, min(max_step, change))
+            control_target_speed = smoothed_control_target
+            speed_error = control_target_speed-ego_speed
+            throttle = max(0.0, min(throttle_limit, speed_error*0.22))
+            if telemetry.action == "BRAKE":
+                # Preserve strong braking for rule-based imminent hazards.
+                brake = max(0.0, min(1.0, -speed_error*0.24))
+            else:
+                # Learned/routine risk responses should bleed speed smoothly,
+                # not turn every modest setpoint change into a hard stop.
+                brake = max(0.0, min(0.45, -speed_error*0.10))
+            # Independent CARLA safety guard uses simulator actor geometry,
+            # not camera range estimates or the planner's lane labels.
+            ego_transform = ego.get_transform()
+            ego_location = ego_transform.location
+            forward = ego_transform.get_forward_vector()
+            right = ego_transform.get_right_vector()
+            corridor_half_width = 4.5 if lane_change_in_progress else 2.5
+            physical_front = None
+            for actor_name, actor, _, _ in others:
+                if not actor.is_alive:
+                    continue
+                location = actor.get_location()
+                dx, dy = location.x-ego_location.x, location.y-ego_location.y
+                longitudinal = dx*forward.x + dy*forward.y
+                lateral = dx*right.x + dy*right.y
+                if longitudinal > 0 and abs(lateral) <= corridor_half_width:
+                    velocity = actor.get_velocity()
+                    actor_speed = max(0.0, velocity.x*forward.x + velocity.y*forward.y)
+                    if physical_front is None or longitudinal < physical_front[0]:
+                        physical_front = (longitudinal, actor_speed, actor_name)
+            safety_required_gap = 0.0
+            safety_override = False
+            if physical_front is not None:
+                front_gap, front_speed, _ = physical_front
+                closing_speed = max(0.0, ego_speed-front_speed)
+                stopping_gap = (5.0 + 3.0 + closing_speed*0.8
+                                + max(0.0, ego_speed**2-front_speed**2)/(2*7.0))
+                safety_required_gap = stopping_gap
+                if safety_braking:
+                    safety_braking = front_gap <= stopping_gap + 4.0
+                else:
+                    safety_braking = front_gap <= stopping_gap
+            else:
+                safety_braking = False
+            if safety_braking:
+                throttle, brake = 0.0, 1.0
+                safety_override = True
+            if collision_halt:
+                ego.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0,
+                                                       steer=0.0, hand_brake=True))
+            else:
+                ego.apply_control(carla.VehicleControl(throttle=throttle, brake=brake, steer=steer))
 
-            sim_time = index*DT
             for actor_name, actor, is_emergency, is_obstacle in others:
                 if not actor.is_alive:
                     continue
@@ -529,7 +765,14 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
                        "near_miss_count": near_miss_count,
                        "min_ttc": min_ttc if math.isfinite(min_ttc) else "inf"})
             ai.update({"scenario": scenario, "planner": mode,
+                       "ego_speed": ego_speed, "ego_lane": int(telemetry.ego_lane),
+                       "target_speed": control_target_speed, "steering": steer,
+                       "throttle": throttle, "brake": brake,
+                       "carla_target_speed_mps": control_target_speed,
+                       "carla_safety_override": safety_override,
+                       "carla_required_gap_m": safety_required_gap,
                        "carla_collision_events": collision_count, "source": "CARLA 0.9.16",
+                       "actual_collision": False, "collision_with_actor_type": "",
                        "prediction_source":planner.prediction_source,
                        "prediction_latency_ms":planner.model_latency_ms,
                        "emergency_detector_status": emergency_detector.status,
@@ -537,6 +780,50 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
                        "emergency_detection_count": len([d for d in latest_detections if d["class"] != "ordinary_vehicle"]),
                        "emergency_detections": json.dumps(latest_detections)})
             ai_rows.append(ai)
+            if web_frame_dir is not None:
+                try:
+                    actor_state = []
+                    actor_flags = {name: (is_emergency, is_obstacle)
+                                   for name, _actor, is_emergency, is_obstacle in others}
+                    for actor, _physical_actor in observed:
+                        is_emergency, is_obstacle = actor_flags.get(actor.actor_id, (False, False))
+                        actor_state.append({
+                            "id": actor.actor_id, "kind": "obstacle" if is_obstacle else actor.kind,
+                            "lane": int(actor.lane), "emergency": bool(is_emergency),
+                            "delta_s": float(actor.s), "speed": float(actor.speed),
+                            "prediction": [],
+                        })
+                    live_state = {
+                        "source": "CARLA", "running": True, "paused": False,
+                        "scenario": scenario, "mode": mode, "seed": seed,
+                        "telemetry_file": "CARLA control telemetry (saved when run ends)",
+                        "last": ai,
+                        "metrics": {
+                            "collision_count": collision_count,
+                            "near_miss_count": near_miss_count,
+                            "minimum_ttc_s": min_ttc if math.isfinite(min_ttc) else None,
+                            "average_risk": risk_sum / max(1, len(ai_rows)),
+                            "path_length_m": travelled,
+                            "response_time_s": response_time,
+                        },
+                        "actors": actor_state,
+                        "ego": {"speed": float(ego_speed), "lane": int(telemetry.ego_lane),
+                                "position": float(travelled)},
+                        "prediction_source": planner.prediction_source,
+                    }
+                    web_frame_dir.mkdir(parents=True, exist_ok=True)
+                    state_tmp = web_frame_dir / f"live-state-{os.getpid()}.tmp"
+                    state_tmp.write_text(json.dumps(_finite_json(live_state), allow_nan=False), encoding="utf-8")
+                    for attempt in range(5):
+                        try:
+                            state_tmp.replace(web_frame_dir / "live-state.json")
+                            break
+                        except PermissionError:
+                            if attempt == 4:
+                                raise
+                            time.sleep(0.01)
+                except (OSError, TypeError, ValueError) as exc:
+                    print(f"[carla_demo] web telemetry snapshot unavailable: {exc}")
             if index % 100 == 0:
                 print(f"[carla_demo] t={sim_time:5.1f}s action={telemetry.action} "
                       f"speed={ego_speed*3.6:4.0f}km/h risk={telemetry.risk_level}:{telemetry.risk_score:.0f} "
@@ -548,12 +835,19 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         ai_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(json.dumps(raw_rows, indent=2), encoding="utf-8")
+        metrics = planner.metrics()
+        unique_collisions = {(row["frame"], row["other_actor_id"]) for row in collision_events}
+        if collision_events and ai_rows:
+            ai_rows[-1]["actual_collision"] = True
+            ai_rows[-1]["carla_collision_events"] = len(unique_collisions)
+            ai_rows[-1]["collision_count"] = len(unique_collisions)
+            ai_rows[-1]["collision_with_actor_type"] = collision_events[0]["other_actor_type"]
+        # Persist after applying the terminal contact label so the experience
+        # builder sees the collision recorded by the sensor.
         with ai_path.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=ai_rows[0].keys() if ai_rows else [])
             writer.writeheader()
             writer.writerows(ai_rows)
-        metrics = planner.metrics()
-        unique_collisions = {(row["frame"], row["other_actor_id"]) for row in collision_events}
         metrics.update({"collision_count": len(unique_collisions), "collision_frames": len(collision_frames),
                         "collision_events": collision_events, "near_miss_count": near_miss_count,
                         "minimum_ttc_s": min_ttc if math.isfinite(min_ttc) else None,
@@ -607,6 +901,10 @@ def run(host: str = "127.0.0.1", port: int = 2000, duration: float | None = 20,
             world.apply_settings(original_settings)
         except Exception:
             pass
+        if stop_file is not None:
+            stop_file.unlink(missing_ok=True)
+        if pause_file is not None:
+            pause_file.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -622,12 +920,29 @@ def main() -> int:
     parser.add_argument("--scenario", choices=(*SCENARIOS, *CAMERA_SCENARIOS), default="Emergency vehicle approaching")
     parser.add_argument("--mode", choices=MODES, default="DRIVEMIND")
     parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--risk-model", type=Path, default=None,
+                        help="candidate risk model JSON; otherwise load an approved active model if present")
+    parser.add_argument("--lane-policy", type=Path, default=None,
+                        help="candidate lane-choice JSON; otherwise load an approved active policy if present")
+    parser.add_argument("--steering-model", type=Path, default=None,
+                        help="steering regression JSON trained from CARLA expert captures")
     parser.add_argument("--no-camera-preview", action="store_true", help="run headless without the camera window")
+    parser.add_argument("--stop-file", type=Path, default=None,
+                        help="stop gracefully when this file appears (used by the local web dashboard)")
+    parser.add_argument("--pause-file", type=Path, default=None,
+                        help="pause CARLA world ticks while this file exists")
+    parser.add_argument("--web-frame-dir", type=Path, default=None,
+                        help="write the latest ego front/rear camera frames for the browser dashboard")
     args = parser.parse_args()
     if not args.continuous and args.duration <= 0:
         parser.error("--duration must be positive")
+    risk_model = CollisionRiskModel.load(args.risk_model) if args.risk_model else None
+    lane_model = LaneChoiceModel.load(args.lane_policy) if args.lane_policy else None
+    steering_model = SteeringModel.load(args.steering_model) if args.steering_model else None
     run(args.host, args.port, None if args.continuous else args.duration, args.scenario, args.mode, args.seed,
-        camera_preview=not args.no_camera_preview)
+        camera_preview=not args.no_camera_preview, risk_model=risk_model, lane_model=lane_model,
+        steering_model=steering_model, stop_file=args.stop_file, pause_file=args.pause_file,
+        web_frame_dir=args.web_frame_dir)
     return 0
 
 

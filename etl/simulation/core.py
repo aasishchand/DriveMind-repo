@@ -14,8 +14,11 @@ from collections import deque
 
 LANES = (0, 1)
 LANE_NAMES = {0: "left", 1: "right"}
-SCENARIOS = ("Normal traffic", "Slower vehicle ahead", "Emergency vehicle approaching", "Obstacle ahead", "Traffic congestion")
+SCENARIOS = ("Normal traffic", "Slower vehicle ahead", "Emergency vehicle approaching",
+             "Obstacle ahead", "Traffic congestion", "Dense traffic lane changes",
+             "Four emergency vehicles")
 MODES = ("BASELINE", "RISK-AWARE", "DRIVEMIND")
+EMERGENCY_APPROACH_SPEED_MPS = 33.0
 
 
 @dataclass
@@ -89,9 +92,19 @@ class DrivingSimulation:
     """Small deterministic world with perception, prediction, planning and control."""
 
     def __init__(self, scenario: str = SCENARIOS[0], mode: str = "DRIVEMIND", seed: int = 7,
-                 predictor=None):
+                 predictor=None, risk_model=None, lane_model=None):
         self.seed = seed
         self.predictor = predictor
+        if risk_model is None:
+            from etl.policy_learning.risk_model import load_active_model
+            from etl.config import REPO_ROOT
+            risk_model = load_active_model(REPO_ROOT)
+        self.risk_model = None if risk_model is False else risk_model
+        if lane_model is None:
+            from etl.policy_learning.lane_model import load_active_lane_model
+            from etl.config import REPO_ROOT
+            lane_model = load_active_lane_model(REPO_ROOT)
+        self.lane_model = None if lane_model is False else lane_model
         self.reset(scenario, mode)
 
     def reset(self, scenario: str | None = None, mode: str | None = None) -> None:
@@ -107,10 +120,20 @@ class DrivingSimulation:
         elif self.scenario == "Slower vehicle ahead":
             self.actors = [Actor("V-01", "car", 25, 8, 0), Actor("V-02", "car", 60, 19, 1)]
         elif self.scenario == "Emergency vehicle approaching":
-            self.actors = [Actor("E-01", "emergency", -36, 27, 0, True),
+            self.actors = [Actor("E-01", "emergency", -36, EMERGENCY_APPROACH_SPEED_MPS, 0, True),
                            Actor("V-01", "car", 48, 16, 1), Actor("V-02", "car", 82, 19, 0)]
         elif self.scenario == "Obstacle ahead":
             self.actors = [Actor("O-01", "obstacle", 28, 0, 0, width=1.7, length=1.7), Actor("V-01", "car", 53, 17, 1)]
+        elif self.scenario == "Dense traffic lane changes":
+            positions = ((20, 0), (38, 1), (56, 0), (74, 1), (92, 0))
+            self.actors = [Actor(f"V-{i+1:02d}", "car", distance, 10.5+(i % 3), lane)
+                           for i, (distance, lane) in enumerate(positions)]
+        elif self.scenario == "Four emergency vehicles":
+            self.actors = [Actor(f"E-{i+1:02d}", "emergency", -45.0*(i+1),
+                                 EMERGENCY_APPROACH_SPEED_MPS, 0, True)
+                           for i in range(4)]
+            self.actors.extend((Actor("V-01", "car", 55, 10, 0),
+                                Actor("V-02", "car", 90, 12, 1)))
         else:
             self.actors = [Actor(f"V-{i:02d}", "car", 18 + i * 12, 11 + (i % 3), i % 2) for i in range(8)]
         self.collision_count = self.near_miss_count = 0
@@ -119,6 +142,8 @@ class DrivingSimulation:
         self.risk_total = 0.0
         self.response_time: float | None = None
         self.risk_samples = 0
+        self.risk_probability_ema = 0.0
+        self.risk_shield_active = False
         self.last = None
         self.telemetry: list[Telemetry] = []
         self.actor_histories: dict[str, deque] = {}
@@ -203,6 +228,14 @@ class DrivingSimulation:
         safe_other = (all(swept_gap_safe(o) for o in objects)
                       and not any(o["emergency"] and o["lane"] == other_lane
                                   and abs(o["s"]-self.ego_s) < 60 for o in objects))
+        if nearest and ahead < 12 and rel > 0.05:
+            if approaching and self.ego_lane == approaching["lane"] and safe_other:
+                return ("YIELD — CLEAR EMERGENCY LANE", min(self.ego_speed, 12.0), other_lane,
+                        "Immediate hazard ahead; clear the lane for the faster emergency vehicle.",
+                        ahead, rel, ttc)
+            return ("BRAKE", 0.0, self.ego_lane,
+                    "Immediate closing hazard ahead; brake before any yielding maneuver.",
+                    ahead, rel, ttc)
         density = sum(o["distance"] < 30 for o in objects)
         model_conflict = bool(nearest and self.mode != "BASELINE"
                               and nearest["prediction_source"] == "LSTM"
@@ -254,21 +287,108 @@ class DrivingSimulation:
         self._update_model_predictions(dt)
         objects = self._perceive()
         action, desired, target_lane, why, distance, rel, ttc = self._plan(objects)
+        if self.lane_model is not None and self.mode != "BASELINE":
+            adjacent_lane = 1-self.ego_lane
+            current_front = min((o for o in objects if o["lane"] == self.ego_lane
+                                 and o["s"] >= self.ego_s),
+                                key=lambda o: o["s"]-self.ego_s, default=None)
+            adjacent_front = min((o for o in objects if o["lane"] == adjacent_lane
+                                  and o["s"] >= self.ego_s),
+                                 key=lambda o: o["s"]-self.ego_s, default=None)
+            adjacent_rear = min((o for o in objects if o["lane"] == adjacent_lane
+                                 and o["s"] < self.ego_s),
+                                key=lambda o: self.ego_s-o["s"], default=None)
+            features = {
+                "ego_speed_mps": self.ego_speed,
+                "current_front_gap_m": current_front["s"]-self.ego_s if current_front else 120.0,
+                "current_front_closing_mps": current_front["rel_speed"] if current_front else 0.0,
+                "adjacent_front_gap_m": adjacent_front["s"]-self.ego_s if adjacent_front else 120.0,
+                "adjacent_front_closing_mps": adjacent_front["rel_speed"] if adjacent_front else 0.0,
+                "adjacent_rear_gap_m": self.ego_s-adjacent_rear["s"] if adjacent_rear else 120.0,
+                "adjacent_rear_closing_mps": max(0.0, adjacent_rear["speed"]-self.ego_speed)
+                if adjacent_rear else 0.0,
+            }
+            wants_change = self.lane_model.change_probability(features) >= self.lane_model.threshold
+            swept_gap_safe = True
+            for obj in objects:
+                if obj["lane"] != adjacent_lane:
+                    continue
+                gap_now = obj["s"]-self.ego_s
+                gap_future = obj["s"]+obj["speed"]*3.0-(self.ego_s+self.ego_speed*3.0)
+                min_gap = 0.0 if gap_now*gap_future <= 0 else min(abs(gap_now), abs(gap_future))
+                if min_gap <= 12.0 or (obj["emergency"] and abs(gap_now) < 60):
+                    swept_gap_safe = False
+                    break
+            if wants_change and swept_gap_safe and distance > 12.0:
+                target_lane, action = adjacent_lane, "LEARNED CHANGE LANE"
+                why = "Lane-choice model recommends an adjacent lane; gap check is clear."
+            elif action == "CHANGE LANE":
+                target_lane = self.ego_lane
+                if current_front:
+                    desired = min(desired, max(0.0, current_front["speed"]+
+                                               max(0.0, distance-8.0)*0.35))
+                action = "LEARNED KEEP LANE"
+                why = "Lane-choice model recommends staying; keep the current lane safe."
+        if self.risk_model is not None:
+            obstacle = any(o["kind"] == "obstacle" and abs(o["s"]-self.ego_s) < 25
+                           for o in objects)
+            density = sum(abs(o["s"]-self.ego_s) < 30 for o in objects)
+            emergency = any(o["emergency"] and o["s"] < self.ego_s+60 for o in objects)
+            current_risk, _ = assess_risk(distance, rel, ttc, obstacle, density, True, emergency)
+            probability = self.risk_model.probability({
+                "ego_speed_mps": self.ego_speed,
+                "nearest_distance_m": distance,
+                "relative_speed_mps": rel,
+                "ttc_s": ttc,
+                "risk_score": current_risk,
+                "emergency_detection_count": sum(o["emergency"] for o in objects),
+            })
+            # Sensor/actor association can change between frames. Smooth the
+            # learned probability and use hysteresis so a single noisy frame
+            # cannot toggle the speed command on and off.
+            self.risk_probability_ema += 0.15 * (probability-self.risk_probability_ema)
+            threshold = self.risk_model.threshold
+            if self.risk_shield_active:
+                if self.risk_probability_ema < threshold-0.08:
+                    self.risk_shield_active = False
+            elif self.risk_probability_ema >= threshold+0.05:
+                self.risk_shield_active = True
+            if self.risk_shield_active and action != "BRAKE":
+                # A moving target based on current speed (ego_speed - 3) lowers
+                # the setpoint again every frame, so any persistent risk score
+                # eventually drives the vehicle to a stop. Use a bounded
+                # reduction from the planner's stable target instead. Explicit
+                # collision/TTC braking is handled by the rule-based planner.
+                severity = (self.risk_probability_ema-threshold) / max(1e-6, 1.0-threshold)
+                risk_reduction = 4.0 * max(0.0, min(1.0, severity))
+                risk_target = max(8.0, desired-risk_reduction)
+                desired = min(desired, risk_target)
+                action = "RISK-AWARE SLOWDOWN"
+                why = (f"Smoothed learned risk is {self.risk_probability_ema:.0%}; "
+                       f"reduce target speed by {risk_reduction:.1f} m/s.")
         self.target_speed = desired
         if target_lane != self.ego_lane:
             self.ego_lane = target_lane
         # Functional longitudinal controller: bounded acceleration and braking.
         delta = self.target_speed - self.ego_speed
-        acceleration = max(-7.0, min(2.8, delta * 1.8))
+        # Only explicit imminent-hazard braking uses the full deceleration
+        # envelope. Ordinary slowdowns use a more comfortable ramp.
+        max_deceleration = 7.0 if action == "BRAKE" else 2.5
+        acceleration = max(-max_deceleration, min(2.8, delta * 1.8))
         self.ego_speed = max(0, self.ego_speed + acceleration * dt)
         throttle = max(0, min(1, acceleration / 2.8))
         brake = max(0, min(1, -acceleration / 7.0))
+        if action == "BRAKE" and brake < 0.01 and abs(delta) < 0.05:
+            action = "FOLLOW VEHICLE"
+            why = "Speed matches the vehicle ahead; maintain the following gap."
         for actor in self.actors:
             actor.s += actor.speed * dt
         self.ego_s += self.ego_speed * dt
         # Remove actors well behind the camera and add deterministic traffic ahead.
         self.actors = [a for a in self.actors if a.s > self.ego_s-55]
-        if len([a for a in self.actors if a.kind == "car"]) < 4 and self.scenario in ("Normal traffic", "Traffic congestion"):
+        if len([a for a in self.actors if a.kind == "car"]) < 4 and self.scenario in (
+            "Normal traffic", "Traffic congestion", "Dense traffic lane changes"
+        ):
             lane = self.rng.choice(LANES)
             self.actors.append(Actor(f"V-{int(self.time*10)+10:02d}", "car", self.ego_s+75+self.rng.random()*35, 13+self.rng.random()*7, lane))
         contacts = [a for a in self.actors if a.lane == self.ego_lane and abs(a.s-self.ego_s) < (3.0 if a.kind != "obstacle" else 2.4)]

@@ -59,7 +59,7 @@ class EmergencyDetector:
 
 def draw_detections(frame: np.ndarray, detections: list[dict]) -> np.ndarray:
     """Render only model-produced boxes. Requires Pillow; input/output are RGB arrays."""
-    from PIL import ImageDraw
+    from PIL import Image, ImageDraw
     image = Image.fromarray(frame.copy())
     draw = ImageDraw.Draw(image)
     for item in detections:

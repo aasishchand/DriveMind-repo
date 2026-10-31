@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 
+MAX_PLAUSIBLE_CLOSING_SPEED_MPS = 20.0
+
 
 class DetectionTracker:
     def __init__(self, max_missed: int = 5, iou_threshold: float = .2):
@@ -57,9 +59,14 @@ def estimate_distance_ttc(detection: dict, frame_width: int, frame_height: int,
     closing = None
     ttc = None
     if prior and delta_s > 0:
-        closing = (prior[0]-range_m)/delta_s
-        if closing > .1:
-            ttc = range_m/closing
+        range_rate = (prior[0]-range_m)/delta_s
+        # Apparent-height range can jump when a detector box changes shape or
+        # the IoU tracker switches objects. Ignore impossible per-frame rates
+        # instead of feeding them into the planner as extreme vehicle speeds.
+        if math.isfinite(range_rate) and abs(range_rate) <= MAX_PLAUSIBLE_CLOSING_SPEED_MPS:
+            closing = range_rate
+            if closing > .1:
+                ttc = range_m/closing
     previous[detection["track_id"]] = (range_m, box_height)
     center_x = (x1+x2)/2
     return {"distance_m": range_m, "closing_speed_mps": closing, "ttc_s": ttc,
